@@ -15,11 +15,17 @@ import (
 	"openclaw_go/internal/tool"
 )
 
-// Run wires the minimum runnable OpenClaw loop for local development.
-func Run(logger *log.Logger) error {
+// Runtime groups wired dependencies used by API and local demo flows.
+type Runtime struct {
+	Orchestrator *agent.Orchestrator
+	Metrics      *obs.Metrics
+}
+
+// NewRuntime builds the minimal runnable OpenClaw dependency graph.
+func NewRuntime(logger *log.Logger) (*Runtime, error) {
 	registry := tool.NewRegistry()
 	if err := registry.Register(tool.NewEchoTool()); err != nil {
-		return fmt.Errorf("register tool: %w", err)
+		return nil, fmt.Errorf("register tool: %w", err)
 	}
 
 	metrics := obs.NewMetrics()
@@ -50,10 +56,20 @@ func Run(logger *log.Logger) error {
 		Logger:   logger,
 	})
 
+	return &Runtime{Orchestrator: orchestrator, Metrics: metrics}, nil
+}
+
+// Run executes one local deterministic run for quick manual verification.
+func Run(logger *log.Logger) error {
+	rt, err := NewRuntime(logger)
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := orchestrator.Run(ctx, agent.Input{
+	result, err := rt.Orchestrator.Run(ctx, agent.Input{
 		RunID:    "demo-run",
 		Goal:     "Say hello from OpenClaw Go migration loop",
 		MaxSteps: 4,
@@ -63,6 +79,6 @@ func Run(logger *log.Logger) error {
 	}
 
 	logger.Printf("status=%s steps=%d final=%q", result.Status, result.Steps, result.Final)
-	logger.Printf("metrics=%v", metrics.Snapshot())
+	logger.Printf("metrics=%v", rt.Metrics.Snapshot())
 	return nil
 }
