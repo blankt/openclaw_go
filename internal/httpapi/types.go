@@ -38,3 +38,25 @@ type runResponse struct {
 type errorResponse struct {
 	Error string `json:"error"`
 }
+
+type Config struct {
+	QueueDepth int
+	RunTimeout time.Duration
+}
+
+func DefaultConfig() Config {
+	return Config{
+		QueueDepth: 128,
+		RunTimeout: 30 * time.Second,
+	}
+}
+
+func (c Config) normalize() Config {
+	if c.QueueDepth <= 0 {
+		c.QueueDepth = 128
+	}
+	if c.RunTimeout <= 0 {
+		c.RunTimeout = 30 * time.Second
+	}
+	return c
+}

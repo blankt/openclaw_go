@@ -25,7 +25,11 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("new runtime: %v", err)
 	}
-	return NewServer(rt.Orchestrator, rt.RunState, rt.Metrics, logger)
+	srv := NewServer(rt.Orchestrator, rt.RunState, rt.Metrics, logger)
+	t.Cleanup(func() {
+		_ = srv.Close(context.Background())
+	})
+	return srv
 }
 
 func TestHealthz(t *testing.T) {
@@ -106,6 +110,7 @@ func TestCreateRunFailureThenGetFailed(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	store := runstate.NewInMemoryStore()
 	srv := NewServer(failingRunner{}, store, obs.NewMetrics(), logger)
+	t.Cleanup(func() { _ = srv.Close(context.Background()) })
 
 	reqCreate := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-fail-1","goal":"should fail"}`)))
 	resCreate := httptest.NewRecorder()
@@ -151,6 +156,7 @@ func TestRunTransitionsToRunningBeforeCompletion(t *testing.T) {
 	store := runstate.NewInMemoryStore()
 	runner := delayedRunner{started: make(chan struct{}), release: make(chan struct{})}
 	srv := NewServer(runner, store, obs.NewMetrics(), logger)
+	t.Cleanup(func() { _ = srv.Close(context.Background()) })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-running-1","goal":"wait"}`)))
 	res := httptest.NewRecorder()
@@ -203,4 +209,87 @@ func waitForRunStatus(t *testing.T, srv *Server, runID string, timeout time.Dura
 	}
 	t.Fatalf("run %s did not reach status %s within %s", runID, wanted, timeout)
 	return runResponse{}
+}
+
+func TestCreateRejectedAfterClose(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	store := runstate.NewInMemoryStore()
+	srv := NewServerWithConfig(failingRunner{}, store, obs.NewMetrics(), logger, Config{QueueDepth: 8, RunTimeout: time.Second})
+	if err := srv.Close(context.Background()); err != nil {
+		t.Fatalf("close server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"after close"}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestCloseWaitsForInFlightJob(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	store := runstate.NewInMemoryStore()
+	runner := delayedRunner{started: make(chan struct{}), release: make(chan struct{})}
+	srv := NewServerWithConfig(runner, store, obs.NewMetrics(), logger, Config{QueueDepth: 8, RunTimeout: 2 * time.Second})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-close-1","goal":"wait close"}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("create expected 202, got %d", res.Code)
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatalf("runner did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- srv.Close(context.Background())
+	}()
+
+	select {
+	case <-closeDone:
+		t.Fatalf("close returned before in-flight job completed")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(runner.release)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("close did not finish after job release")
+	}
+}
+
+type timeoutRunner struct{}
+
+func (timeoutRunner) Run(ctx context.Context, _ agent.Input) (agent.Result, error) {
+	<-ctx.Done()
+	return agent.Result{}, ctx.Err()
+}
+
+func TestRunTimeoutFromConfig(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	store := runstate.NewInMemoryStore()
+	srv := NewServerWithConfig(timeoutRunner{}, store, obs.NewMetrics(), logger, Config{QueueDepth: 8, RunTimeout: 50 * time.Millisecond})
+	t.Cleanup(func() { _ = srv.Close(context.Background()) })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-timeout-1","goal":"timeout"}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("create expected 202, got %d", res.Code)
+	}
+
+	out := waitForRunStatus(t, srv, "r-timeout-1", 2*time.Second, string(runstate.StatusFailed))
+	if out.Error == "" {
+		t.Fatalf("expected timeout error")
+	}
 }
