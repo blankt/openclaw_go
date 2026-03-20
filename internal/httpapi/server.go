@@ -20,11 +20,26 @@ type Server struct {
 	metrics  *obs.Metrics
 	logger   *log.Logger
 	mux      *http.ServeMux
+	jobs     chan queuedJob
+}
+
+type queuedJob struct {
+	RunID    string
+	Goal     string
+	MaxSteps int
 }
 
 func NewServer(runner Runner, runState RunStateStore, metrics *obs.Metrics, logger *log.Logger) *Server {
-	s := &Server{runner: runner, runState: runState, metrics: metrics, logger: logger, mux: http.NewServeMux()}
+	s := &Server{
+		runner:   runner,
+		runState: runState,
+		metrics:  metrics,
+		logger:   logger,
+		mux:      http.NewServeMux(),
+		jobs:     make(chan queuedJob, 128),
+	}
 	s.routes()
+	go s.runWorker()
 	return s
 }
 
@@ -83,42 +98,8 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		runID = fmt.Sprintf("run-%d", time.Now().UTC().UnixNano())
 	}
 
-	if err := s.runState.Put(r.Context(), runstate.Run{RunID: runID, Goal: req.Goal, Status: runstate.StatusQueued}); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to persist run")
-		return
-	}
-	if err := s.runState.Put(r.Context(), runstate.Run{RunID: runID, Goal: req.Goal, Status: runstate.StatusRunning}); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to persist run")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
-	defer cancel()
-
-	result, err := s.runner.Run(ctx, agent.Input{RunID: runID, Goal: req.Goal, MaxSteps: req.MaxSteps})
-	if err != nil {
-		s.metrics.Inc("http.run.error")
-		msg := "run execution failed"
-		if s.logger != nil {
-			s.logger.Printf("create run failed run_id=%s err=%v", runID, err)
-		}
-		_ = s.runState.Put(r.Context(), runstate.Run{RunID: runID, Goal: req.Goal, Status: runstate.StatusFailed, Error: err.Error()})
-		writeError(w, http.StatusInternalServerError, msg)
-		return
-	}
-
-	run := runstate.Run{
-		RunID:  runID,
-		Goal:   req.Goal,
-		Status: runstate.StatusCompleted,
-		Final:  result.Final,
-		Steps:  result.Steps,
-	}
-	if result.Status != "completed" {
-		run.Status = runstate.StatusFailed
-		run.Error = "run terminated without completion"
-	}
-	if err := s.runState.Put(r.Context(), run); err != nil {
+	queued := runstate.Run{RunID: runID, Goal: req.Goal, Status: runstate.StatusQueued}
+	if err := s.runState.Put(r.Context(), queued); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to persist run")
 		return
 	}
@@ -128,7 +109,47 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to read persisted run")
 		return
 	}
-	writeJSON(w, http.StatusOK, toRunResponse(stored))
+
+	select {
+	case s.jobs <- queuedJob{RunID: runID, Goal: req.Goal, MaxSteps: req.MaxSteps}:
+		s.metrics.Inc("http.run.enqueued")
+		writeJSON(w, http.StatusAccepted, toRunResponse(stored))
+	default:
+		s.metrics.Inc("http.run.rejected")
+		_ = s.runState.Put(r.Context(), runstate.Run{RunID: runID, Goal: req.Goal, Status: runstate.StatusFailed, Error: "queue is full"})
+		writeError(w, http.StatusServiceUnavailable, "run queue is full")
+	}
+}
+
+func (s *Server) runWorker() {
+	for job := range s.jobs {
+		s.executeJob(job)
+	}
+}
+
+func (s *Server) executeJob(job queuedJob) {
+	ctx := context.Background()
+	_ = s.runState.Put(ctx, runstate.Run{RunID: job.RunID, Goal: job.Goal, Status: runstate.StatusRunning})
+
+	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	result, err := s.runner.Run(runCtx, agent.Input{RunID: job.RunID, Goal: job.Goal, MaxSteps: job.MaxSteps})
+	if err != nil {
+		s.metrics.Inc("http.run.error")
+		if s.logger != nil {
+			s.logger.Printf("run worker failed run_id=%s err=%v", job.RunID, err)
+		}
+		_ = s.runState.Put(ctx, runstate.Run{RunID: job.RunID, Goal: job.Goal, Status: runstate.StatusFailed, Error: err.Error()})
+		return
+	}
+
+	run := runstate.Run{RunID: job.RunID, Goal: job.Goal, Status: runstate.StatusCompleted, Final: result.Final, Steps: result.Steps}
+	if result.Status != "completed" {
+		run.Status = runstate.StatusFailed
+		run.Error = "run terminated without completion"
+	}
+	_ = s.runState.Put(ctx, run)
 }
 
 func toRunResponse(run runstate.Run) runResponse {

@@ -30,17 +30,15 @@ func newTestServer(t *testing.T) *Server {
 
 func TestHealthz(t *testing.T) {
 	srv := newTestServer(t)
-
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	res := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(res, req)
-
 	if res.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", res.Code)
 	}
 }
 
-func TestCreateRunSuccess(t *testing.T) {
+func TestCreateRunAccepted(t *testing.T) {
 	srv := newTestServer(t)
 
 	body, _ := json.Marshal(createRunRequest{Goal: "hello api", MaxSteps: 4})
@@ -48,8 +46,8 @@ func TestCreateRunSuccess(t *testing.T) {
 	res := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(res, req)
 
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", res.Code, res.Body.String())
 	}
 
 	var out runResponse
@@ -59,8 +57,8 @@ func TestCreateRunSuccess(t *testing.T) {
 	if out.RunID == "" {
 		t.Fatalf("expected run_id")
 	}
-	if out.Status != string(runstate.StatusCompleted) {
-		t.Fatalf("expected completed status, got %q", out.Status)
+	if out.Status != string(runstate.StatusQueued) && out.Status != string(runstate.StatusRunning) {
+		t.Fatalf("expected queued/running status on create, got %q", out.Status)
 	}
 }
 
@@ -94,23 +92,13 @@ func TestCreateRunThenGetCompleted(t *testing.T) {
 	reqCreate := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-get-1","goal":"get after create"}`)))
 	resCreate := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(resCreate, reqCreate)
-	if resCreate.Code != http.StatusOK {
-		t.Fatalf("create expected 200, got %d", resCreate.Code)
+	if resCreate.Code != http.StatusAccepted {
+		t.Fatalf("create expected 202, got %d", resCreate.Code)
 	}
 
-	reqGet := httptest.NewRequest(http.MethodGet, "/v1/runs/r-get-1", nil)
-	resGet := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(resGet, reqGet)
-
-	if resGet.Code != http.StatusOK {
-		t.Fatalf("get expected 200, got %d body=%s", resGet.Code, resGet.Body.String())
-	}
-	var out runResponse
-	if err := json.Unmarshal(resGet.Body.Bytes(), &out); err != nil {
-		t.Fatalf("decode get response: %v", err)
-	}
-	if out.Status != string(runstate.StatusCompleted) {
-		t.Fatalf("expected completed status, got %q", out.Status)
+	out := waitForRunStatus(t, srv, "r-get-1", 2*time.Second, string(runstate.StatusCompleted))
+	if out.Final == "" {
+		t.Fatalf("expected final response content")
 	}
 }
 
@@ -122,24 +110,11 @@ func TestCreateRunFailureThenGetFailed(t *testing.T) {
 	reqCreate := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-fail-1","goal":"should fail"}`)))
 	resCreate := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(resCreate, reqCreate)
-	if resCreate.Code != http.StatusInternalServerError {
-		t.Fatalf("create expected 500, got %d body=%s", resCreate.Code, resCreate.Body.String())
+	if resCreate.Code != http.StatusAccepted {
+		t.Fatalf("create expected 202, got %d body=%s", resCreate.Code, resCreate.Body.String())
 	}
 
-	reqGet := httptest.NewRequest(http.MethodGet, "/v1/runs/r-fail-1", nil)
-	resGet := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(resGet, reqGet)
-	if resGet.Code != http.StatusOK {
-		t.Fatalf("get expected 200, got %d", resGet.Code)
-	}
-
-	var out runResponse
-	if err := json.Unmarshal(resGet.Body.Bytes(), &out); err != nil {
-		t.Fatalf("decode get response: %v", err)
-	}
-	if out.Status != string(runstate.StatusFailed) {
-		t.Fatalf("expected failed status, got %q", out.Status)
-	}
+	out := waitForRunStatus(t, srv, "r-fail-1", 2*time.Second, string(runstate.StatusFailed))
 	if out.Error == "" {
 		t.Fatalf("expected error message for failed run")
 	}
@@ -157,7 +132,12 @@ type delayedRunner struct {
 }
 
 func (d delayedRunner) Run(ctx context.Context, in agent.Input) (agent.Result, error) {
-	close(d.started)
+	select {
+	case <-d.started:
+		// started already signaled
+	default:
+		close(d.started)
+	}
 	select {
 	case <-d.release:
 	case <-ctx.Done():
@@ -172,13 +152,12 @@ func TestRunTransitionsToRunningBeforeCompletion(t *testing.T) {
 	runner := delayedRunner{started: make(chan struct{}), release: make(chan struct{})}
 	srv := NewServer(runner, store, obs.NewMetrics(), logger)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-running-1","goal":"wait"}`)))
-		res := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(res, req)
-	}()
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-running-1","goal":"wait"}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("create expected 202, got %d", res.Code)
+	}
 
 	select {
 	case <-runner.started:
@@ -201,9 +180,27 @@ func TestRunTransitionsToRunningBeforeCompletion(t *testing.T) {
 	}
 
 	close(runner.release)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("request did not finish")
+	waitForRunStatus(t, srv, "r-running-1", 2*time.Second, string(runstate.StatusCompleted))
+}
+
+func waitForRunStatus(t *testing.T, srv *Server, runID string, timeout time.Duration, wanted string) runResponse {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/runs/"+runID, nil)
+		res := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(res, req)
+		if res.Code == http.StatusOK {
+			var out runResponse
+			if err := json.Unmarshal(res.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode run response: %v", err)
+			}
+			if out.Status == wanted {
+				return out
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	t.Fatalf("run %s did not reach status %s within %s", runID, wanted, timeout)
+	return runResponse{}
 }
