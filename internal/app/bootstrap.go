@@ -11,6 +11,7 @@ import (
 	"openclaw_go/internal/llm"
 	"openclaw_go/internal/memory"
 	"openclaw_go/internal/obs"
+	"openclaw_go/internal/runstate"
 	"openclaw_go/internal/runtime"
 	"openclaw_go/internal/tool"
 )
@@ -18,6 +19,7 @@ import (
 // Runtime groups wired dependencies used by API and local demo flows.
 type Runtime struct {
 	Orchestrator *agent.Orchestrator
+	RunState     runstate.Store
 	Metrics      *obs.Metrics
 }
 
@@ -30,6 +32,7 @@ func NewRuntime(logger *log.Logger) (*Runtime, error) {
 
 	metrics := obs.NewMetrics()
 	store := memory.NewInMemoryStore()
+	runState := runstate.NewInMemoryStore()
 	packer := ctxpack.NewPacker(ctxpack.Config{
 		MaxPromptTokens:   800,
 		ReserveForOutput:  200,
@@ -56,7 +59,7 @@ func NewRuntime(logger *log.Logger) (*Runtime, error) {
 		Logger:   logger,
 	})
 
-	return &Runtime{Orchestrator: orchestrator, Metrics: metrics}, nil
+	return &Runtime{Orchestrator: orchestrator, RunState: runState, Metrics: metrics}, nil
 }
 
 // Run executes one local deterministic run for quick manual verification.
