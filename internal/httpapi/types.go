@@ -39,15 +39,24 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type metricsResponse struct {
+	Counters      map[string]int64 `json:"counters"`
+	QueueDepth    int              `json:"queue_depth"`
+	QueueCapacity int              `json:"queue_capacity"`
+	WorkerCount   int              `json:"worker_count"`
+}
+
 type Config struct {
-	QueueDepth int
-	RunTimeout time.Duration
+	QueueDepth  int
+	RunTimeout  time.Duration
+	WorkerCount int
 }
 
 func DefaultConfig() Config {
 	return Config{
-		QueueDepth: 128,
-		RunTimeout: 30 * time.Second,
+		QueueDepth:  128,
+		RunTimeout:  30 * time.Second,
+		WorkerCount: 1,
 	}
 }
 
@@ -57,6 +66,9 @@ func (c Config) normalize() Config {
 	}
 	if c.RunTimeout <= 0 {
 		c.RunTimeout = 30 * time.Second
+	}
+	if c.WorkerCount <= 0 {
+		c.WorkerCount = 1
 	}
 	return c
 }

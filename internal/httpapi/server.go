@@ -3,10 +3,13 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"openclaw_go/internal/agent"
@@ -21,6 +24,13 @@ type Server struct {
 	logger   *log.Logger
 	mux      *http.ServeMux
 	jobs     chan queuedJob
+	cfg      Config
+
+	closed       atomic.Bool
+	jobWG        sync.WaitGroup
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
+	workerWG     sync.WaitGroup
 }
 
 type queuedJob struct {
@@ -30,17 +40,62 @@ type queuedJob struct {
 }
 
 func NewServer(runner Runner, runState RunStateStore, metrics *obs.Metrics, logger *log.Logger) *Server {
+	return NewServerWithConfig(runner, runState, metrics, logger, DefaultConfig())
+}
+
+func NewServerWithConfig(runner Runner, runState RunStateStore, metrics *obs.Metrics, logger *log.Logger, cfg Config) *Server {
+	cfg = cfg.normalize()
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+
 	s := &Server{
-		runner:   runner,
-		runState: runState,
-		metrics:  metrics,
-		logger:   logger,
-		mux:      http.NewServeMux(),
-		jobs:     make(chan queuedJob, 128),
+		runner:       runner,
+		runState:     runState,
+		metrics:      metrics,
+		logger:       logger,
+		mux:          http.NewServeMux(),
+		jobs:         make(chan queuedJob, cfg.QueueDepth),
+		cfg:          cfg,
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 	}
 	s.routes()
-	go s.runWorker()
+	for i := 0; i < cfg.WorkerCount; i++ {
+		s.workerWG.Add(1)
+		go s.runWorker()
+	}
 	return s
+}
+
+// Close drains accepted jobs, then cancels the worker loop.
+func (s *Server) Close(ctx context.Context) error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		s.jobWG.Wait()
+	}()
+
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	s.workerCancel()
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		s.workerWG.Wait()
+	}()
+	select {
+	case <-workersDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -51,6 +106,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("POST /v1/runs", s.handleCreateRun)
 	s.mux.HandleFunc("GET /v1/runs/{id}", s.handleGetRun)
+	s.mux.HandleFunc("GET /v1/metrics", s.handleGetMetrics)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -81,6 +137,11 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	s.metrics.Inc("http.run.create")
 
+	if s.closed.Load() {
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+
 	var req createRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -110,34 +171,59 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Count accepted work before enqueue to avoid worker Done/Add races.
+	s.jobWG.Add(1)
 	select {
 	case s.jobs <- queuedJob{RunID: runID, Goal: req.Goal, MaxSteps: req.MaxSteps}:
 		s.metrics.Inc("http.run.enqueued")
 		writeJSON(w, http.StatusAccepted, toRunResponse(stored))
 	default:
+		s.jobWG.Done()
 		s.metrics.Inc("http.run.rejected")
 		_ = s.runState.Put(r.Context(), runstate.Run{RunID: runID, Goal: req.Goal, Status: runstate.StatusFailed, Error: "queue is full"})
 		writeError(w, http.StatusServiceUnavailable, "run queue is full")
 	}
 }
 
+func (s *Server) handleGetMetrics(w http.ResponseWriter, _ *http.Request) {
+	s.metrics.Inc("http.metrics.get")
+	writeJSON(w, http.StatusOK, metricsResponse{
+		Counters:      s.metrics.Snapshot(),
+		QueueDepth:    len(s.jobs),
+		QueueCapacity: cap(s.jobs),
+		WorkerCount:   s.cfg.WorkerCount,
+	})
+}
+
 func (s *Server) runWorker() {
-	for job := range s.jobs {
-		s.executeJob(job)
+	defer s.workerWG.Done()
+	for {
+		select {
+		case <-s.workerCtx.Done():
+			return
+		case job := <-s.jobs:
+			s.executeJob(job)
+			s.jobWG.Done()
+		}
 	}
 }
 
 func (s *Server) executeJob(job queuedJob) {
 	ctx := context.Background()
+	s.metrics.Inc("run.started")
+	s.metrics.Add("run.inflight", 1)
+	defer s.metrics.Add("run.inflight", -1)
+
 	_ = s.runState.Put(ctx, runstate.Run{RunID: job.RunID, Goal: job.Goal, Status: runstate.StatusRunning})
 
-	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, s.cfg.RunTimeout)
 	defer cancel()
 
 	result, err := s.runner.Run(runCtx, agent.Input{RunID: job.RunID, Goal: job.Goal, MaxSteps: job.MaxSteps})
 	if err != nil {
 		s.metrics.Inc("http.run.error")
-		if s.logger != nil {
+		s.metrics.Inc("run.failed")
+		if s.logger != nil && !errors.Is(err, context.DeadlineExceeded) {
 			s.logger.Printf("run worker failed run_id=%s err=%v", job.RunID, err)
 		}
 		_ = s.runState.Put(ctx, runstate.Run{RunID: job.RunID, Goal: job.Goal, Status: runstate.StatusFailed, Error: err.Error()})
@@ -148,6 +234,9 @@ func (s *Server) executeJob(job queuedJob) {
 	if result.Status != "completed" {
 		run.Status = runstate.StatusFailed
 		run.Error = "run terminated without completion"
+		s.metrics.Inc("run.failed")
+	} else {
+		s.metrics.Inc("run.completed")
 	}
 	_ = s.runState.Put(ctx, run)
 }
