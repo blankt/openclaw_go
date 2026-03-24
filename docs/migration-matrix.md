@@ -16,11 +16,11 @@ This matrix tracks semantic parity goals rather than line-by-line translation.
 | Observability | `internal/obs.Metrics`, `internal/httpapi` | M2 | Emit and expose loop/tool/runtime counters for diagnostics | Done (in-memory counters + GET /v1/metrics) |
 | Browser execution | `internal/browser/*` | M3 | Equivalent browser action semantics and retries | Planned |
 | Concurrent scheduling | `internal/scheduler/*` | M3 | Multi-worker fairness and cancellation semantics | Planned |
-| Security governance | `internal/security/*` | M4 | Policy checks, audit events, redaction and authn/z integration | Planned |
+| Security governance | `internal/httpapi.requireIngressAuth`, `internal/httpapi.requireCreateRunRateLimit` | M4 | API key and per-client ingress rate limiting on mutating endpoint | Done (Bearer auth + 429 guardrail for POST /v1/runs) |
 
 ## Milestone acceptance
 
 - M1: `go run ./cmd/agentd` serves health and run APIs.
 - M2: Run lifecycle (`queued/running/completed/failed`) is persisted and queryable.
 - M3: `POST /v1/runs` returns `202`, worker pool updates terminal state asynchronously, and shutdown drains in-flight jobs.
-- M4: Security controls enforce tool and action policies.
+- M4: Ingress guardrails enforce API key policy and per-client rate limiting on run submission.

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"openclaw_go/internal/agent"
@@ -47,16 +48,19 @@ type metricsResponse struct {
 }
 
 type Config struct {
-	QueueDepth  int
-	RunTimeout  time.Duration
-	WorkerCount int
+	QueueDepth    int
+	RunTimeout    time.Duration
+	WorkerCount   int
+	IngressAPIKey string
+	CreateRunRPM  int
 }
 
 func DefaultConfig() Config {
 	return Config{
-		QueueDepth:  128,
-		RunTimeout:  30 * time.Second,
-		WorkerCount: 1,
+		QueueDepth:   128,
+		RunTimeout:   30 * time.Second,
+		WorkerCount:  1,
+		CreateRunRPM: 60,
 	}
 }
 
@@ -70,5 +74,9 @@ func (c Config) normalize() Config {
 	if c.WorkerCount <= 0 {
 		c.WorkerCount = 1
 	}
+	if c.CreateRunRPM < 0 {
+		c.CreateRunRPM = 0
+	}
+	c.IngressAPIKey = strings.TrimSpace(c.IngressAPIKey)
 	return c
 }

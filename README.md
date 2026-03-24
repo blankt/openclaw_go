@@ -14,7 +14,7 @@ Minimal, runnable bootstrap for migrating OpenClaw core capabilities from TypeSc
 - In-memory counters for observability (`internal/obs`).
 - ServeMux HTTP API (`internal/httpapi`) with:
   - `GET /healthz`
-  - `POST /v1/runs` (async enqueue, returns `202 Accepted`)
+  - `POST /v1/runs` (async enqueue, returns `202 Accepted`; optional Bearer auth)
   - `GET /v1/runs/{id}` (poll run status)
   - `GET /v1/metrics` (in-memory counters + scheduler metadata)
 - Single worker graceful shutdown (`httpapi.Server.Close`) and configurable queue/timeout.
@@ -44,6 +44,8 @@ Environment options:
 - `AGENTD_QUEUE_DEPTH` (default `128`)
 - `AGENTD_RUN_TIMEOUT` (default `30s`, Go duration format)
 - `AGENTD_WORKER_COUNT` (default `1`)
+- `AGENTD_INGRESS_API_KEY` (optional; protects `POST /v1/runs`)
+- `AGENTD_CREATE_RUN_RPM` (default `60`; set `0` to disable rate limiting)
 
 ## API smoke test
 
@@ -51,6 +53,7 @@ Environment options:
 curl -sS http://127.0.0.1:8080/healthz
 curl -sS -X POST http://127.0.0.1:8080/v1/runs \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer secret-token' \
   -d '{"run_id":"demo-1","goal":"hello from api"}'
 curl -sS http://127.0.0.1:8080/v1/runs/demo-1
 curl -sS http://127.0.0.1:8080/v1/metrics

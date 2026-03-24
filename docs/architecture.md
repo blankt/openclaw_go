@@ -58,6 +58,8 @@ sequenceDiagram
 ## Notes
 
 - `POST /v1/runs` is asynchronous and returns quickly with queue-backed status.
+- `POST /v1/runs` can be guarded by optional Bearer ingress API key.
+- `POST /v1/runs` supports per-client fixed-window rate limiting (`429` + `Retry-After`).
 - `httpapi.Config` controls queue depth, worker count, and per-run timeout.
 - `httpapi.Server.Close` drains accepted jobs before worker shutdown.
 - Queue dispatch remains FIFO with concurrent execution when multiple workers are configured.

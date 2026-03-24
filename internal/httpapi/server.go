@@ -2,10 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ type Server struct {
 	mux      *http.ServeMux
 	jobs     chan queuedJob
 	cfg      Config
+	limiter  *rateLimiter
 
 	closed       atomic.Bool
 	jobWG        sync.WaitGroup
@@ -55,6 +58,7 @@ func NewServerWithConfig(runner Runner, runState RunStateStore, metrics *obs.Met
 		mux:          http.NewServeMux(),
 		jobs:         make(chan queuedJob, cfg.QueueDepth),
 		cfg:          cfg,
+		limiter:      newRateLimiter(cfg.CreateRunRPM, time.Minute, time.Now),
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
 	}
@@ -104,9 +108,71 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
-	s.mux.HandleFunc("POST /v1/runs", s.handleCreateRun)
+	s.mux.HandleFunc("POST /v1/runs", s.requireIngressAuth(s.requireCreateRunRateLimit(s.handleCreateRun)))
 	s.mux.HandleFunc("GET /v1/runs/{id}", s.handleGetRun)
 	s.mux.HandleFunc("GET /v1/metrics", s.handleGetMetrics)
+}
+
+func (s *Server) requireCreateRunRateLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		allowed, retryAfter := s.limiter.allow(clientIDFromRequest(r))
+		if !allowed {
+			s.metrics.Inc("http.ratelimit.rejected")
+			seconds := int(retryAfter.Seconds())
+			if seconds <= 0 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", seconds))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		s.metrics.Inc("http.ratelimit.accepted")
+		next(w, r)
+	}
+}
+
+func clientIDFromRequest(r *http.Request) string {
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			first := strings.TrimSpace(parts[0])
+			if first != "" {
+				return first
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	if r.RemoteAddr != "" {
+		return strings.TrimSpace(r.RemoteAddr)
+	}
+	return "unknown"
+}
+
+func (s *Server) requireIngressAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.IngressAPIKey == "" {
+			next(w, r)
+			return
+		}
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			s.metrics.Inc("http.auth.rejected")
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		token := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.IngressAPIKey)) != 1 {
+			s.metrics.Inc("http.auth.rejected")
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		s.metrics.Inc("http.auth.accepted")
+		next(w, r)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

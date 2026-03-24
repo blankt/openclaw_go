@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,25 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("new runtime: %v", err)
 	}
 	srv := NewServer(rt.Orchestrator, rt.RunState, rt.Metrics, logger)
+	t.Cleanup(func() {
+		_ = srv.Close(context.Background())
+	})
+	return srv
+}
+
+func newAuthTestServer(t *testing.T, apiKey string) *Server {
+	t.Helper()
+	logger := log.New(io.Discard, "", 0)
+	rt, err := app.NewRuntime(logger)
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	srv := NewServerWithConfig(rt.Orchestrator, rt.RunState, rt.Metrics, logger, Config{
+		QueueDepth:    8,
+		RunTimeout:    2 * time.Second,
+		WorkerCount:   1,
+		IngressAPIKey: apiKey,
+	})
 	t.Cleanup(func() {
 		_ = srv.Close(context.Background())
 	})
@@ -416,5 +436,107 @@ func TestMetricsCountersAfterCompletedRun(t *testing.T) {
 	}
 	if out.Counters["run.inflight"] != 0 {
 		t.Fatalf("expected run.inflight == 0, got %d", out.Counters["run.inflight"])
+	}
+}
+
+func TestCreateRunAuthRequiredMissingToken(t *testing.T) {
+	srv := newAuthTestServer(t, "secret-token")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"auth"}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestCreateRunAuthRequiredInvalidToken(t *testing.T) {
+	srv := newAuthTestServer(t, "secret-token")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"auth"}`)))
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestCreateRunAuthRequiredValidToken(t *testing.T) {
+	srv := newAuthTestServer(t, "secret-token")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"run_id":"r-auth-1","goal":"auth"}`)))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", res.Code, res.Body.String())
+	}
+	waitForRunStatus(t, srv, "r-auth-1", 2*time.Second, string(runstate.StatusCompleted))
+}
+
+func TestCreateRunRateLimitExceeded(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	srv.limiter = newRateLimiter(1, time.Minute, func() time.Time { return now })
+
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"r1"}`)))
+	res1 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res1, req1)
+	if res1.Code != http.StatusAccepted {
+		t.Fatalf("expected first request 202, got %d", res1.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"r2"}`)))
+	res2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res2, req2)
+	if res2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected second request 429, got %d body=%s", res2.Code, res2.Body.String())
+	}
+	if strings.TrimSpace(res2.Header().Get("Retry-After")) == "" {
+		t.Fatalf("expected Retry-After header on 429 response")
+	}
+
+	health := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("expected health route unaffected, got %d", health.Code)
+	}
+}
+
+func TestCreateRunRateLimitWindowReset(t *testing.T) {
+	srv := newTestServer(t)
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	srv.limiter = newRateLimiter(1, time.Minute, func() time.Time { return now })
+
+	res1 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res1, httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"r1"}`))))
+	if res1.Code != http.StatusAccepted {
+		t.Fatalf("expected first request 202, got %d", res1.Code)
+	}
+
+	res2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res2, httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"r2"}`))))
+	if res2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected second request 429, got %d", res2.Code)
+	}
+
+	now = now.Add(61 * time.Second)
+	res3 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res3, httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"r3"}`))))
+	if res3.Code != http.StatusAccepted {
+		t.Fatalf("expected request after window reset 202, got %d", res3.Code)
+	}
+}
+
+func TestAuthCheckedBeforeRateLimit(t *testing.T) {
+	srv := newAuthTestServer(t, "secret-token")
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	srv.limiter = newRateLimiter(1, time.Minute, func() time.Time { return now })
+
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"auth-first"}`))))
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when token missing, got %d", res.Code)
 	}
 }
