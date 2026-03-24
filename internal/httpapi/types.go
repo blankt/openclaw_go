@@ -48,19 +48,21 @@ type metricsResponse struct {
 }
 
 type Config struct {
-	QueueDepth    int
-	RunTimeout    time.Duration
-	WorkerCount   int
-	IngressAPIKey string
-	CreateRunRPM  int
+	QueueDepth            int
+	RunTimeout            time.Duration
+	WorkerCount           int
+	IngressAPIKey         string
+	CreateRunRPM          int
+	CreateRunMaxBodyBytes int64
 }
 
 func DefaultConfig() Config {
 	return Config{
-		QueueDepth:   128,
-		RunTimeout:   30 * time.Second,
-		WorkerCount:  1,
-		CreateRunRPM: 60,
+		QueueDepth:            128,
+		RunTimeout:            30 * time.Second,
+		WorkerCount:           1,
+		CreateRunRPM:          60,
+		CreateRunMaxBodyBytes: 16 * 1024,
 	}
 }
 
@@ -76,6 +78,9 @@ func (c Config) normalize() Config {
 	}
 	if c.CreateRunRPM < 0 {
 		c.CreateRunRPM = 0
+	}
+	if c.CreateRunMaxBodyBytes <= 0 {
+		c.CreateRunMaxBodyBytes = 16 * 1024
 	}
 	c.IngressAPIKey = strings.TrimSpace(c.IngressAPIKey)
 	return c

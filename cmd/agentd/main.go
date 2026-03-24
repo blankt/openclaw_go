@@ -24,11 +24,12 @@ func main() {
 	}
 
 	api := httpapi.NewServerWithConfig(rt.Orchestrator, rt.RunState, rt.Metrics, logger, httpapi.Config{
-		QueueDepth:    envIntOrDefault("AGENTD_QUEUE_DEPTH", 128),
-		RunTimeout:    envDurationOrDefault("AGENTD_RUN_TIMEOUT", 30*time.Second),
-		WorkerCount:   envIntOrDefault("AGENTD_WORKER_COUNT", 1),
-		IngressAPIKey: envOrDefault("AGENTD_INGRESS_API_KEY", ""),
-		CreateRunRPM:  envIntOrDefault("AGENTD_CREATE_RUN_RPM", 60),
+		QueueDepth:            envIntOrDefault("AGENTD_QUEUE_DEPTH", 128),
+		RunTimeout:            envDurationOrDefault("AGENTD_RUN_TIMEOUT", 30*time.Second),
+		WorkerCount:           envIntOrDefault("AGENTD_WORKER_COUNT", 1),
+		IngressAPIKey:         envOrDefault("AGENTD_INGRESS_API_KEY", ""),
+		CreateRunRPM:          envIntOrDefault("AGENTD_CREATE_RUN_RPM", 60),
+		CreateRunMaxBodyBytes: int64(envIntOrDefault("AGENTD_CREATE_RUN_MAX_BODY_BYTES", 16384)),
 	})
 	srv := &http.Server{
 		Addr:    envOrDefault("AGENTD_ADDR", ":8080"),

@@ -540,3 +540,46 @@ func TestAuthCheckedBeforeRateLimit(t *testing.T) {
 		t.Fatalf("expected 401 when token missing, got %d", res.Code)
 	}
 }
+
+func TestCreateRunRejectsUnknownFields(t *testing.T) {
+	srv := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"ok","unknown":1}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestCreateRunRejectsTrailingJSON(t *testing.T) {
+	srv := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{"goal":"ok"}{"goal":"extra"}`)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestCreateRunRejectsOversizedBody(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	rt, err := app.NewRuntime(logger)
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	srv := NewServerWithConfig(rt.Orchestrator, rt.RunState, rt.Metrics, logger, Config{
+		QueueDepth:            8,
+		RunTimeout:            2 * time.Second,
+		WorkerCount:           1,
+		CreateRunMaxBodyBytes: 32,
+	})
+	t.Cleanup(func() { _ = srv.Close(context.Background()) })
+
+	body := `{"goal":"` + strings.Repeat("x", 128) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(body)))
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", res.Code, res.Body.String())
+	}
+}
